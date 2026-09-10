@@ -1,6 +1,6 @@
 import requests
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # City → coordinates
 CITY_COORDS = {
@@ -16,22 +16,47 @@ CITY_COORDS = {
     "chicago": (41.88, -87.63),
     "tokyo": (35.68, 139.76),
     "beijing": (39.90, 116.41),
+    "moscow": (55.76, 37.62),
+    "munich": (48.14, 11.58),
+    "wellington": (-41.29, 174.78),
 }
 
+def get_upcoming_dates(days=3):
+    """Return list of upcoming dates in readable format."""
+    today = datetime.now(timezone.utc).date()
+    dates = []
+    for i in range(0, days + 1):
+        d = today + timedelta(days=i)
+        dates.append(d.strftime("%B %-d").replace(" 0", " "))
+    return dates
+
 def get_weather_events():
-    """Search for active daily temperature events."""
-    url = "https://gamma-api.polymarket.com/public-search"
-    params = {"q": "highest temperature", "limit": 15}
-    
-    response = requests.get(url, params=params, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    
+    """Search for temperature markets on upcoming days."""
     events = []
-    for event in data.get("events", []):
-        title = event.get("title", "")
-        if "highest temperature" in title.lower():
-            events.append(event)
+    seen_slugs = set()
+    
+    dates = get_upcoming_dates(3)
+    
+    for date_str in dates:
+        url = "https://gamma-api.polymarket.com/public-search"
+        params = {"q": f"highest temperature {date_str}", "limit": 10}
+        
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            
+            for event in data.get("events", []):
+                title = event.get("title", "")
+                slug = event.get("slug", "")
+                
+                if "highest temperature" in title.lower() and slug not in seen_slugs:
+                    if event.get("closed") is False:
+                        events.append(event)
+                        seen_slugs.add(slug)
+        except Exception:
+            continue
+    
     return events
 
 def get_forecast(city_name: str):
@@ -54,7 +79,7 @@ def get_forecast(city_name: str):
         "longitude": lon,
         "daily": "temperature_2m_max",
         "timezone": "auto",
-        "forecast_days": 3
+        "forecast_days": 5
     }
     
     try:
@@ -97,13 +122,17 @@ def parse_bucket(question: str):
         return None, None
 
 def main():
-    print("Weather Scanner + Simple Edge")
+    print("Weather Scanner + Simple Edge (Future Markets)")
     print("Time (UTC):", datetime.now(timezone.utc).isoformat())
     print("=" * 60)
 
     try:
         events = get_weather_events()
-        print(f"Found {len(events)} temperature events\n")
+        print(f"Found {len(events)} open temperature events\n")
+
+        if not events:
+            print("No open markets found right now. Try again later.")
+            return
 
         for event in events:
             title = event.get("title", "")
@@ -116,11 +145,15 @@ def main():
                 print("  Forecast: not available\n")
                 continue
 
-            today_forecast = forecast[0][1] if forecast else None
-            print(f"  Forecast max temp: {today_forecast}°C")
+            print("  Forecast max temp:")
+            for date, temp in forecast[:3]:
+                print(f"    {date}: {temp}°C")
 
-            print("  Buckets:")
+            today_forecast = forecast[0][1]
+
+            print("  Open buckets:")
             best_edge = None
+            open_count = 0
             
             for market in event.get("markets", []):
                 question = market.get("question", "")
@@ -135,25 +168,27 @@ def main():
                 except Exception:
                     continue
 
+                if yes_price <= 0.01 or yes_price >= 0.99:
+                    continue
+
                 bucket_temp, bucket_type = parse_bucket(question)
                 if bucket_temp is None:
                     continue
 
+                open_count += 1
                 diff = abs(today_forecast - bucket_temp)
+                edge_score = (0.5 - abs(0.5 - yes_price)) - (diff * 0.04)
                 
-                if 0.02 < yes_price < 0.95:
-                    edge_score = (0.5 - abs(0.5 - yes_price)) - (diff * 0.05)
-                    
-                    print(f"    {bucket_temp}°C ({bucket_type}) | YES: {yes_price:.2f} | diff: {diff:.1f}°C")
-                    
-                    if best_edge is None or edge_score > best_edge[0]:
-                        best_edge = (edge_score, bucket_temp, yes_price, diff)
+                print(f"    {bucket_temp}°C ({bucket_type}) | YES: {yes_price:.2f} | diff: {diff:.1f}°C")
+                
+                if best_edge is None or edge_score > best_edge[0]:
+                    best_edge = (edge_score, bucket_temp, yes_price, diff)
 
-            if best_edge:
+            if open_count == 0:
+                print("    (no open buckets)")
+            elif best_edge:
                 score, temp, price, diff = best_edge
-                print(f"  → Best looking bucket: {temp}°C at {price:.2f} (diff {diff:.1f}°C)")
-            else:
-                print("  → No clear open buckets (many may already be resolved)")
+                print(f"  → Best looking: {temp}°C at price {price:.2f} (diff {diff:.1f}°C)")
 
             print()
 

@@ -12,6 +12,8 @@ import requests
 LEDGER_PATH = os.environ.get("PAPER_CSV", "paper_ledger.csv")
 MIN_EDGE = float(os.environ.get("MIN_EDGE", "0.08"))
 PAPER_SIZE = float(os.environ.get("PAPER_SIZE", "10"))
+MAX_BASKET = float(os.environ.get("MAX_BASKET", "0.60"))
+MIN_RUNGS = int(os.environ.get("MIN_RUNGS", "2"))
 MIN_PRICE = 0.05
 MAX_PRICE = 0.90
 
@@ -428,9 +430,12 @@ def send_email(subject, body):
 def main():
     now = datetime.now(timezone.utc)
     today = now.date()
-    log("Weather Scanner + Settlement + Daily Email")
+    log("Weather Scanner + 3-rung Ladder + Settlement")
     log("Time (UTC):", now.isoformat())
-    log(f"Rules: min edge {MIN_EDGE:.0%}, paper size ${PAPER_SIZE:.0f}")
+    log(
+        f"Rules: cluster edge {MIN_EDGE:.0%}, basket cap {MAX_BASKET:.2f}, "
+        f"paper ${PAPER_SIZE:.0f}, min rungs {MIN_RUNGS}"
+    )
     log("=" * 64)
 
     rows = load_ledger(LEDGER_PATH)
@@ -469,55 +474,105 @@ def main():
         sigma = sigma_for_lead(lead)
         log(f"  Model: mu={mu:.1f}C  sigma={sigma:.2f}  lead={lead}d")
 
-        best = None
-        open_count = 0
+        exacts = {}
+        listed = 0
         for market in event.get("markets", []):
             yes_price = parse_yes_price(market)
-            if yes_price is None or yes_price <= MIN_PRICE or yes_price >= MAX_PRICE:
-                continue
             parsed, kind = parse_bucket(market.get("question") or "")
-            if parsed is None:
+            if parsed is None or kind is None:
+                continue
+            if yes_price is None or yes_price <= MIN_PRICE or yes_price >= MAX_PRICE:
                 continue
             model_p = bucket_probability(kind, parsed, mu, sigma)
             edge = model_p - yes_price
-            open_count += 1
+            listed += 1
             label = parsed if kind != "range" else f"{parsed[0]}-{parsed[1]}"
             log(f"    {label} {kind:5} | YES {yes_price:.2f} | model {model_p:.2f} | edge {edge:+.2f}")
-            if best is None or edge > best["edge"]:
-                best = {"label": label, "kind": kind, "yes_price": yes_price, "model_p": model_p, "edge": edge}
-
-            if edge >= MIN_EDGE and market_date and not already_open(rows, city, label, market_date):
-                trade = {
-                    "id": make_id(now, city, label, market_date),
-                    "opened_utc": now.isoformat(),
-                    "settled_utc": "",
-                    "city": city,
-                    "event_title": title,
-                    "market_date": market_date.isoformat(),
-                    "bucket": str(label),
+            if kind == "exact":
+                exacts[int(round(float(parsed)))] = {
+                    "label": str(int(round(float(parsed)))),
                     "kind": kind,
-                    "side": "YES",
-                    "model_prob": f"{model_p:.4f}",
-                    "market_price": f"{yes_price:.4f}",
-                    "edge": f"{edge:.4f}",
-                    "forecast_c": f"{mu:.2f}",
-                    "sigma": f"{sigma:.2f}",
-                    "paper_size": f"{PAPER_SIZE:.2f}",
-                    "actual_c": "",
-                    "result": "",
-                    "pnl": "",
-                    "status": "OPEN",
+                    "yes_price": yes_price,
+                    "model_p": model_p,
+                    "edge": edge,
                 }
-                rows.append(trade)
-                new_trades.append(trade)
 
-        if open_count == 0:
+        if listed == 0:
             log("    (no open buckets in price band)")
-        elif best:
+            log("")
+            continue
+
+        if not market_date:
+            log("  Ladder skipped: no market date")
+            log("")
+            continue
+
+        center = int(round(mu))
+        wanted = [center - 1, center, center + 1]
+        rungs = [exacts[t] for t in wanted if t in exacts]
+
+        cluster_p = sum(r["model_p"] for r in rungs)
+        basket = sum(r["yes_price"] for r in rungs)
+        cluster_edge = cluster_p - basket
+        log(
+            f"  Ladder target: {wanted[0]}/{wanted[1]}/{wanted[2]}C  "
+            f"found {len(rungs)}/{len(wanted)}  "
+            f"P={cluster_p:.2f} cost={basket:.2f} edge={cluster_edge:+.2f}"
+        )
+
+        if len(rungs) < MIN_RUNGS:
+            log("  Ladder skipped: not enough exact rungs")
+            log("")
+            continue
+        if basket > MAX_BASKET:
+            log(f"  Ladder skipped: basket {basket:.2f} > cap {MAX_BASKET:.2f}")
+            log("")
+            continue
+        if cluster_edge < MIN_EDGE:
+            log("  Ladder skipped: cluster edge below minimum")
+            log("")
+            continue
+
+        weight_sum = sum(max(r["model_p"], 0.01) for r in rungs)
+        placed = 0
+        for r in rungs:
+            if already_open(rows, city, r["label"], market_date):
+                log(f"  Skip {r['label']}: already in ledger")
+                continue
+            weight = max(r["model_p"], 0.01) / weight_sum
+            size = round(PAPER_SIZE * weight, 2)
+            if size < 1:
+                size = 1.0
+            trade = {
+                "id": make_id(now, city, r["label"], market_date),
+                "opened_utc": now.isoformat(),
+                "settled_utc": "",
+                "city": city,
+                "event_title": title,
+                "market_date": market_date.isoformat(),
+                "bucket": r["label"],
+                "kind": r["kind"],
+                "side": "YES",
+                "model_prob": f"{r['model_p']:.4f}",
+                "market_price": f"{r['yes_price']:.4f}",
+                "edge": f"{cluster_edge:.4f}",
+                "forecast_c": f"{mu:.2f}",
+                "sigma": f"{sigma:.2f}",
+                "paper_size": f"{size:.2f}",
+                "actual_c": "",
+                "result": "",
+                "pnl": "",
+                "status": "OPEN",
+            }
+            rows.append(trade)
+            new_trades.append(trade)
+            placed += 1
             log(
-                f"  Best bucket: {best['label']} {best['kind']} | "
-                f"YES {best['yes_price']:.2f} | model {best['model_p']:.2f} | edge {best['edge']:+.2f}"
+                f"  PAPER LADDER YES {city} {r['label']} @ {r['yes_price']:.2f} "
+                f"size ${size:.2f} (cluster edge {cluster_edge:+.2f})"
             )
+        if placed == 0:
+            log("  Ladder: no new rungs (already booked)")
         log("")
 
     save_ledger(LEDGER_PATH, rows)
